@@ -5,7 +5,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc};
 
 use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
@@ -18,6 +18,8 @@ use futures_util::{
 };
 
 use crate::extractors::{basic, bearer, AuthExtractor};
+use std::borrow::{BorrowMut};
+use glob::Pattern;
 
 /// Middleware for checking HTTP authentication.
 ///
@@ -26,35 +28,58 @@ use crate::extractors::{basic, bearer, AuthExtractor};
 ///
 /// Otherwise, it will pass both the request and the parsed credentials into it. In case of
 /// successful validation `F` callback is required to return the `ServiceRequest` back.
-#[derive(Debug, Clone)]
-pub struct HttpAuthentication<T, F>
+#[derive(Clone)]
+pub struct HttpAuthentication<T, F, B>
 where
     T: AuthExtractor,
 {
     process_fn: Arc<F>,
+    extractor_error_fn: Option<Arc<ExtractorErrorCallback<B>>>,
+    excluded_paths: Rc<Vec<Pattern>>,
     _extractor: PhantomData<T>,
 }
 
-impl<T, F, O> HttpAuthentication<T, F>
+#[doc(hidden)]
+type ExtractorErrorCallback<T> = dyn Fn(ServiceRequest, Error) -> Result<ServiceResponse<T>, Error>;
+
+impl<T, F, O, B> HttpAuthentication<T, F, B>
 where
     T: AuthExtractor,
     F: Fn(ServiceRequest, T) -> O,
     O: Future<Output = Result<ServiceRequest, Error>>,
+    B: 'static
 {
     /// Construct `HttpAuthentication` middleware with the provided auth extractor `T` and
     /// validation callback `F`.
-    pub fn with_fn(process_fn: F) -> HttpAuthentication<T, F> {
+    pub fn with_fn(process_fn: F) -> HttpAuthentication<T, F, B> {
         HttpAuthentication {
             process_fn: Arc::new(process_fn),
+            extractor_error_fn: None,
+            excluded_paths: Rc::new(vec![]),
             _extractor: PhantomData,
         }
     }
+
+    /// Modify an already constructed `HttpAuthentication` and add a callback `EF` for
+    /// extraction errors.
+    pub fn on_extraction_error(mut self, extraction_error_fn: Box<ExtractorErrorCallback<B>>) -> HttpAuthentication<T, F, B> {
+        self.extractor_error_fn = Some(Arc::new(extraction_error_fn));
+        self
+    }
+
+    /// Modify an already constructed `HttpAuthenticaion` and exclude a pattern of paths from
+    /// being authenticated.
+    pub fn exclude_path(mut self, path: &str) -> HttpAuthentication<T, F, B> {
+        Rc::get_mut(&mut self.excluded_paths).unwrap().push(Pattern::new(path).unwrap());
+        self
+    }
 }
 
-impl<F, O> HttpAuthentication<basic::BasicAuth, F>
+impl<F, O, B> HttpAuthentication<basic::BasicAuth, F, B>
 where
     F: Fn(ServiceRequest, basic::BasicAuth) -> O,
     O: Future<Output = Result<ServiceRequest, Error>>,
+    B: 'static,
 {
     /// Construct `HttpAuthentication` middleware for the HTTP "Basic" authentication scheme.
     ///
@@ -81,12 +106,14 @@ where
     pub fn basic(process_fn: F) -> Self {
         Self::with_fn(process_fn)
     }
+
 }
 
-impl<F, O> HttpAuthentication<bearer::BearerAuth, F>
+impl<F, O, B> HttpAuthentication<bearer::BearerAuth, F, B>
 where
     F: Fn(ServiceRequest, bearer::BearerAuth) -> O,
     O: Future<Output = Result<ServiceRequest, Error>>,
+    B: 'static,
 {
     /// Construct `HttpAuthentication` middleware for the HTTP "Bearer" authentication scheme.
     ///
@@ -116,9 +143,10 @@ where
     pub fn bearer(process_fn: F) -> Self {
         Self::with_fn(process_fn)
     }
+
 }
 
-impl<S, B, T, F, O> Transform<S> for HttpAuthentication<T, F>
+impl<S, B, T, F, O> Transform<S> for HttpAuthentication<T, F, B>
 where
     S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>
         + 'static,
@@ -126,11 +154,12 @@ where
     F: Fn(ServiceRequest, T) -> O + 'static,
     O: Future<Output = Result<ServiceRequest, Error>> + 'static,
     T: AuthExtractor + 'static,
+    B: 'static
 {
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Transform = AuthenticationMiddleware<S, F, T>;
+    type Transform = AuthenticationMiddleware<S, F, T, B>;
     type InitError = ();
     type Future = future::Ready<Result<Self::Transform, Self::InitError>>;
 
@@ -138,22 +167,27 @@ where
         future::ok(AuthenticationMiddleware {
             service: Rc::new(RefCell::new(service)),
             process_fn: self.process_fn.clone(),
+            extractor_error_fn: self.extractor_error_fn.clone(),
+            excluded_paths: self.excluded_paths.clone(),
             _extractor: PhantomData,
         })
     }
 }
 
 #[doc(hidden)]
-pub struct AuthenticationMiddleware<S, F, T>
+#[derive(Clone)]
+pub struct AuthenticationMiddleware<S, F, T, B>
 where
     T: AuthExtractor,
 {
     service: Rc<RefCell<S>>,
     process_fn: Arc<F>,
+    extractor_error_fn: Option<Arc<ExtractorErrorCallback<B>>>,
+    excluded_paths: Rc<Vec<Pattern>>,
     _extractor: PhantomData<T>,
 }
 
-impl<S, B, F, T, O> Service for AuthenticationMiddleware<S, F, T>
+impl<S, B, F, T, O> Service for AuthenticationMiddleware<S, F, T, B>
 where
     S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>
         + 'static,
@@ -161,6 +195,7 @@ where
     F: Fn(ServiceRequest, T) -> O + 'static,
     O: Future<Output = Result<ServiceRequest, Error>> + 'static,
     T: AuthExtractor + 'static,
+    B: 'static,
 {
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
@@ -174,13 +209,26 @@ where
     fn call(&mut self, req: Self::Request) -> Self::Future {
         let process_fn = Arc::clone(&self.process_fn);
 
-        let service = Rc::clone(&self.service);
+        let mut service = Rc::clone(&self.service);
+
+        let extractor_err_fn_opt = self.extractor_error_fn.clone();
+
+        let excluded_paths = Rc::clone(&self.excluded_paths);
 
         async move {
+            if !excluded_paths.is_empty() && excluded_paths.iter().any(|pt| pt.matches(req.path())) {
+                let fut = service.borrow_mut().call(req);
+                return fut.await;
+            }
+
             let (req, credentials) = match Extract::<T>::new(req).await {
                 Ok(req) => req,
                 Err((err, req)) => {
-                    return Ok(req.error_response(err));
+                    return if let Some(callback) = extractor_err_fn_opt {
+                        callback(req, err)
+                    } else {
+                        Ok(req.error_response(err))
+                    }
                 }
             };
 
@@ -264,6 +312,8 @@ mod tests {
                 },
             ))),
             process_fn: Arc::new(|req, _: BearerAuth| async { Ok(req) }),
+            extractor_error_fn: None,
+            excluded_paths: Rc::new(vec![]),
             _extractor: PhantomData,
         };
 
@@ -287,6 +337,8 @@ mod tests {
                 },
             ))),
             process_fn: Arc::new(|req, _: BearerAuth| async { Ok(req) }),
+            extractor_error_fn: None,
+            excluded_paths: Rc::new(vec![]),
             _extractor: PhantomData,
         };
 
